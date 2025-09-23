@@ -3289,6 +3289,14 @@ class ReasoningConfig:
     """Token ID that indicates the start of reasoning."""
     think_end_token_ids: Optional[list[int]] = None
     """Token ID that indicates the end of reasoning."""
+    soft_limit_threshold: Optional[float] = None
+    """Coefficient between soft limit and hard limit."""
+    sentence_end_tokens: Optional[list[int]] = None
+    """List of token IDs that indicate the end of a sentence."""
+    soft_limit_boost: Optional[float] = None
+    """Boost factor applied when the soft limit threshold is reached."""
+    token_boosts: Optional[dict[str, float]] = None
+    """Dictionary mapping token IDs to boost values."""
 
     def is_thinking_enabled(self) -> bool:
         """Check if both start and end thinking token IDs

@@ -292,8 +292,12 @@ class MinTokensLogitsProcessor(LogitsProcessor):
 class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
     """Limits the number of tokens allowed inside a 'thinking' section."""
 
-    def __init__(self, vllm_config: "VllmConfig", device: torch.device,
-                 is_pin_memory: bool):
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        device: torch.device,
+        is_pin_memory: bool,
+    ):
         """
         Args:
           vllm_config: Configuration for vllm, which includes
@@ -305,33 +309,60 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
 
         # Check if thinking is enabled
-        self.is_enabled = (reasoning_config is not None
-                           and reasoning_config.is_thinking_enabled())
+        self.is_enabled = (
+            reasoning_config is not None
+            and reasoning_config.is_thinking_enabled()
+        )
 
-        self.think_start_token_ids = getattr(reasoning_config,
-                                             "think_start_token_ids", [])
-        self.think_end_token_ids = getattr(reasoning_config,
-                                           "think_end_token_ids", [])
+        # Configure token boundaries
+        self.think_start_token_ids = getattr(
+            reasoning_config, "think_start_token_ids", []
+        )
+        self.think_end_token_ids = getattr(
+            reasoning_config, "think_end_token_ids", []
+        )
 
+        # Soft limit configuration
+        self.soft_limit_threshold = getattr(
+            reasoning_config, "soft_limit_threshold", 0.0
+        )
+        self.soft_limit_enabled = self.soft_limit_threshold > 0
+        self.sentence_end_tokens = getattr(
+            reasoning_config, "sentence_end_tokens", {},
+        )
+        self.soft_limit_boost = getattr(
+            reasoning_config, "soft_limit_boost", 0.0
+        )
+        token_boosts = getattr(
+            reasoning_config, "token_boosts", {}
+        )
+        self.token_boosts = {int(k): v for k, v in token_boosts.items()}
+
+        # Runtime state tracking
         self.pin_memory = is_pin_memory
         self.device = device
         self._state: dict[int, dict[str, Any]] = {}
 
         # Preallocate reusable tensors
         self.mask = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
-        self.force_token_ids = torch.full((max_num_reqs,),
-                                          -1,
-                                          dtype=torch.long,
-                                          device=device)
+        self.force_token_ids = torch.full(
+            (max_num_reqs,), -1, dtype=torch.long, device=device
+        )
+        self.soft_limit_active = torch.zeros(
+            max_num_reqs, dtype=torch.bool, device=device
+        )
 
     @staticmethod
-    def _find_last_sequence_index(target_list: list[int],
-                                  token_ids: list[int]) -> int:
+    def _find_last_sequence_index(
+        target_list: list[int], token_ids: list[int]
+    ) -> int:
         """
-        Returns the index of the last occurrence of token_ids in target_list.
+        Finds the last occurrence of a token sequence in a target list.
         Args:
-          target_list (list[int]): The list of token IDs.
-          token_ids (list[int]): The sequence of token IDs to find.
+            target_list: List of token IDs to search in
+            token_ids: Sequence of token IDs to find
+        Returns:
+            Index of the last occurrence, or -1 if not found
         """
         if not token_ids:
             return -1
@@ -340,44 +371,56 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 return i
         return -1
 
-    def _init_state_entry(self, prompt_tok_ids: list[int],
-                          thinking_token_budget: int) -> dict[str, Any]:
-        """Initializes the tracking state for a given sequence index."""
-        last_start = self._find_last_sequence_index(prompt_tok_ids,
-                                                    self.think_start_token_ids)
-        last_end = self._find_last_sequence_index(prompt_tok_ids,
-                                                  self.think_end_token_ids)
+    def _init_state_entry(
+        self, prompt_tok_ids: list[int], thinking_token_budget: int
+    ) -> dict[str, Any]:
+        """
+        Initializes tracking state for a sequence.
+        Args:
+            prompt_tok_ids: Token IDs of the prompt
+            thinking_token_budget: Maximum tokens allowed in thinking section
+        Returns:
+            Initial state dictionary
+        """
+        last_start = self._find_last_sequence_index(
+            prompt_tok_ids, self.think_start_token_ids
+        )
+        last_end = self._find_last_sequence_index(
+            prompt_tok_ids, self.think_end_token_ids
+        )
         in_think = last_start > last_end
+        think_count = 0
         if in_think:
             think_count = len(prompt_tok_ids) - (
-                last_start + len(self.think_start_token_ids))
-        else:
-            think_count = 0
+                last_start + len(self.think_start_token_ids)
+            )
+        soft_limit_token_budget = max(
+            5,
+            min(30, int(thinking_token_budget * self.soft_limit_threshold))
+        )
 
         return {
             "in_think": in_think,  # Currently in thinking mode
             "in_end": False,  # Currently forcing end tokens
-            "check_count_down": thinking_token_budget,
             "think_count": think_count,  # Number of tokens in thinking section
             "end_count": 0,  # Number of end tokens forced so far
             "prompt_tok_ids": prompt_tok_ids,
             "output_tok_ids": [],
             "thinking_token_budget": thinking_token_budget,
-            "prev_output_length":
-                0,  # Track previous output length for incremental updates
+            # Track previous output length for incremental updates
+            "prev_output_length": 0,
+            "soft_limit_token_budget": soft_limit_token_budget,
+            "soft_limit_active": False,  # Soft limit is being applied
+            "soft_limit_success": False,  # Mark soft limit successful
         }
 
     def _update_think_state(self, state: dict[str, Any]):
-        """Updates the state based on newly generated output tokens."""
-        if not state.get("in_end", False) and state.get("check_count_down",
-                                                        0) > 0:
-            state["check_count_down"] -= 1
-            return
-
+        """
+        Updates thinking state based on newly generated tokens.
+        Args:
+            state: Current state dictionary to update
+        """
         output = state.get("output_tok_ids", [])
-        if not output:
-            return
-
         # Track previous output length for incremental processing
         prev_length = state.get("prev_output_length", 0)
         current_length = len(output)
@@ -400,63 +443,102 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
         # Find any think start/end sequences in recent tokens
         recent_start_pos = self._find_last_sequence_index(
-            recent_tokens, self.think_start_token_ids)
+            recent_tokens, self.think_start_token_ids
+        )
         recent_end_pos = self._find_last_sequence_index(
-            recent_tokens, self.think_end_token_ids)
+            recent_tokens, self.think_end_token_ids
+        )
 
         # Update state based on recent sequences
         if not state["in_end"]:
+            # Handle thinking section boundaries
             if recent_start_pos >= 0 and recent_end_pos >= 0:
                 if recent_start_pos > recent_end_pos:
                     # Case: ...<end>...<start>... - entering think mode
                     absolute_start_pos = check_start_idx + recent_start_pos
-                    new_think_count = current_length - (absolute_start_pos +
-                                                        start_len)
                     state["in_think"] = True
-                    state["think_count"] = new_think_count
+                    state["think_count"] = current_length - (
+                        absolute_start_pos + start_len
+                    )
+                    # Reset soft limit when entering new think section
+                    state["soft_limit_active"] = False
+                    state["soft_limit_success"] = False
                 else:
                     # Case: ...<start>...<end>... - exiting think mode
                     state["in_think"] = False
                     state["think_count"] = 0
+                    # Reset soft limit when exiting think mode
+                    state["soft_limit_active"] = False
+                    state["soft_limit_success"] = False
             elif recent_start_pos >= 0:
                 # Found think start - entering think mode
                 absolute_start_pos = check_start_idx + recent_start_pos
-                new_think_count = current_length - (absolute_start_pos +
-                                                    start_len)
                 state["in_think"] = True
-                state["think_count"] = new_think_count
+                state["think_count"] = current_length - (
+                    absolute_start_pos + start_len
+                )
+                # Reset soft limit when entering new think section
+                state["soft_limit_active"] = False
+                state["soft_limit_success"] = False
             elif recent_end_pos >= 0:
                 # Found think end - exiting think mode
                 state["in_think"] = False
                 state["think_count"] = 0
+                # Reset soft limit when exiting think mode
+                state["soft_limit_active"] = False
+                state["soft_limit_success"] = False
             elif state["in_think"]:
-                # Continue thinking mode, increment count by new tokens
-                state["think_count"] += len(new_tokens)
+                # Process tokens within thinking section
+                for token in new_tokens:
+                    state["think_count"] += 1
 
-            # Set countdown based on current state
-            if state["in_think"]:
-                remaining_budget = max(
-                    0, state["thinking_token_budget"] - state["think_count"])
-                state["check_count_down"] = remaining_budget
-            else:
-                state["check_count_down"] = state["thinking_token_budget"]
+                    if self.soft_limit_enabled:
+                        # Activate soft limit when approaching budget
+                        if (
+                            not state["soft_limit_active"]
+                            and state["think_count"]
+                            >= (state["thinking_token_budget"]
+                                - state["soft_limit_token_budget"])
+                        ):
+                            state["soft_limit_active"] = True
 
-            # Check if need to transition to end mode
-            if state["in_think"] and state["think_count"] >= state[
-                "thinking_token_budget"]:
-                state["in_think"] = False
-                state["in_end"] = True
-                state["end_count"] = 0
-                state["check_count_down"] = state["thinking_token_budget"]
+                        # Handle soft limit success
+                        if (state["soft_limit_active"]
+                            and not state["soft_limit_success"]
+                            and token in self.sentence_end_tokens):
+                            # Exit thinking mode naturally
+                            # TODO
+                            # Need validation sentence end here
+                            # if self._is_valid_sentence_end(
+                            #     state, output, token
+                            # ):
+                            state["soft_limit_success"] = True
+                            state["in_think"] = False
+                            state["in_end"] = True
+                            state["end_count"] = 0
+                            break
+                    else:
+                        state["soft_limit_active"] = False
+                        state["soft_limit_success"] = False
+
+                    # Enforce hard limit when budget exceeded
+                    if state["think_count"] >= state["thinking_token_budget"]:
+                        state["in_think"] = False
+                        state["in_end"] = True
+                        state["end_count"] = 0
+                        break
         else:
-            # In end mode
+            # Process end token sequence
             state["end_count"] += 1
             if state["end_count"] >= len(self.think_end_token_ids):
-                state.update({
-                    "in_end": False,
-                    "end_count": 0,
-                    "check_count_down": state["thinking_token_budget"]
-                })
+                state.update(
+                    {
+                        "in_end": False,
+                        "end_count": 0,
+                        "soft_limit_active": False,
+                        "soft_limit_success": False,
+                    }
+                )
 
     def is_argmax_invariant(self) -> bool:
         """This logits processor can change the outcome of
@@ -465,24 +547,38 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         return False
 
     def update_state(self, batch_update: Optional[BatchUpdate]):
+        """
+        Updates internal state based on batch changes.
+        Args:
+            batch_update: Description of batch changes
+        """
         if not self.is_enabled:
             return
+
         if batch_update:
-            for (index, params, prompt_tok_ids, output_tok_ids) \
-                in batch_update.added:
+            # Process added sequences
+            for (
+                index,
+                params,
+                prompt_tok_ids,
+                output_tok_ids,
+            ) in batch_update.added:
                 thinking_token_budget = params.thinking_token_budget
 
                 if thinking_token_budget is not None:
                     self._state[index] = self._init_state_entry(
-                        prompt_tok_ids, thinking_token_budget)
+                        prompt_tok_ids, thinking_token_budget
+                    )
                     self._state[index]["output_tok_ids"] = output_tok_ids
                 else:
                     # Remove state if no thinking budget
                     self._state.pop(index, None)
 
+            # Process removed sequences
             for index in batch_update.removed:
                 self._state.pop(index, {})
 
+            # Process sequence movements
             for i1, i2, direction in batch_update.moved:
                 if direction == MoveDirectionality.SWAP:
                     state1 = self._state.get(i1, {})
@@ -493,33 +589,74 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 else:
                     self._state[i2] = self._state.pop(i1, {})
 
-        for state in self._state.values():
+        # Reset soft limit tracking
+        self.soft_limit_active.zero_()
+
+        # Update state for all active sequences
+        for i, state in self._state.items():
             self._update_think_state(state)
+            if (
+                self.soft_limit_enabled
+                and state["soft_limit_active"]
+                and state["in_think"]
+            ):
+                self.soft_limit_active[i] = True
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Applies token budget constraints to logits.
+        Args:
+            logits: Original logits from model
+        Returns:
+            Modified logits with budget constraints applied
+        """
         if not self.is_enabled or not self._state:
             return logits
 
         batch_size = logits.size(0)
         self.mask[:batch_size] = False
 
+        # Identify sequences requiring end tokens
         for i in range(batch_size):
             state = self._state.get(i)
             if state and state["in_end"]:
                 self.mask[i] = True
-                self.force_token_ids[i] = \
-                    self.think_end_token_ids[state["end_count"]]
+                self.force_token_ids[i] = self.think_end_token_ids[
+                    state["end_count"]
+                ]
 
-        # Check in CPU first not to sync with GPU
-        has_active_thinking = any(
-            state.get("in_end", False) for state in self._state.values())
-
-        if has_active_thinking:
-            current_mask = self.mask[:batch_size]
-            active_indices = current_mask.nonzero(as_tuple=False).view(-1)
-            if len(active_indices) > 0:
+        # Apply forced end tokens
+        if any(state.get("in_end", False) for state in self._state.values()):
+            active_indices = self.mask[:batch_size].nonzero().view(-1)
+            if active_indices.numel() > 0:
                 force_tokens = self.force_token_ids[active_indices]
                 # Apply a large value for the end thinking token id index
-                logits[active_indices, force_tokens] = 1e9
+                logits[active_indices, force_tokens] = float("inf")
+
+        # Apply soft limit constraints
+        if (
+            self.soft_limit_enabled
+            and self.soft_limit_active[:batch_size].any()
+        ):
+            soft_limit_indices = (
+                self.soft_limit_active[:batch_size].nonzero().view(-1)
+            )
+
+            # Restrict to sentence end tokens only
+            mask = torch.ones_like(logits, dtype=torch.bool)
+            for token_id in self.sentence_end_tokens:
+                if token_id < logits.size(1):
+                    mask[soft_limit_indices, token_id] = False
+            logits[soft_limit_indices] = logits[soft_limit_indices].masked_fill(
+                mask[soft_limit_indices], float("-inf")
+            )
+
+            # Apply priority boosts to sentence end tokens
+            for token_id in self.sentence_end_tokens:
+                if token_id < logits.size(1):
+                    boost = self.token_boosts.get(
+                        token_id, self.soft_limit_boost
+                    )
+                    logits[soft_limit_indices, token_id] += boost
 
         return logits
