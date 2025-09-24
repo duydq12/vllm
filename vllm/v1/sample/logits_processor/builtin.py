@@ -315,27 +315,17 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         )
 
         # Configure token boundaries
-        self.think_start_token_ids = getattr(
-            reasoning_config, "think_start_token_ids", []
+        self.think_start_token_ids = (
+            reasoning_config.think_start_token_ids or []
         )
-        self.think_end_token_ids = getattr(
-            reasoning_config, "think_end_token_ids", []
-        )
+        self.think_end_token_ids = reasoning_config.think_end_token_ids or []
 
         # Soft limit configuration
-        self.soft_limit_threshold = getattr(
-            reasoning_config, "soft_limit_threshold", 0.0
-        )
+        self.soft_limit_threshold = reasoning_config.soft_limit_threshold or 0.0
         self.soft_limit_enabled = self.soft_limit_threshold > 0
-        self.sentence_end_tokens = getattr(
-            reasoning_config, "sentence_end_tokens", {},
-        )
-        self.soft_limit_boost = getattr(
-            reasoning_config, "soft_limit_boost", 0.0
-        )
-        token_boosts = getattr(
-            reasoning_config, "token_boosts", {}
-        )
+        self.sentence_end_tokens = reasoning_config.sentence_end_tokens or {}
+        self.soft_limit_boost = reasoning_config.soft_limit_boost or 0.0
+        token_boosts = reasoning_config.token_boosts or {}
         self.token_boosts = {int(k): v for k, v in token_boosts.items()}
 
         # Runtime state tracking
