@@ -632,15 +632,6 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 self.soft_limit_active[:batch_size].nonzero().view(-1)
             )
 
-            # Restrict to sentence end tokens only
-            mask = torch.ones_like(logits, dtype=torch.bool)
-            for token_id in self.sentence_end_tokens:
-                if token_id < logits.size(1):
-                    mask[soft_limit_indices, token_id] = False
-            logits[soft_limit_indices] = logits[soft_limit_indices].masked_fill(
-                mask[soft_limit_indices], float("-inf")
-            )
-
             # Apply priority boosts to sentence end tokens
             for token_id in self.sentence_end_tokens:
                 if token_id < logits.size(1):
